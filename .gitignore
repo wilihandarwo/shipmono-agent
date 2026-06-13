@@ -1,0 +1,5 @@
+/dist/
+/dist-a/
+/dist-b/
+*.tmp
+.DS_Store
