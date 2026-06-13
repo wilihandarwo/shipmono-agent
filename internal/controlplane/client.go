@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -34,9 +35,27 @@ func New(baseURL string) *Client {
 		httpc: &http.Client{
 			// Generous enough for slow networks, short enough that a hung
 			// control plane doesn't wedge the loop forever.
-			Timeout: 20 * time.Second,
+			Timeout:   20 * time.Second,
+			Transport: ipv4PreferringTransport(),
 		},
 	}
+}
+
+// ipv4PreferringTransport dials the control plane over IPv4 when the box has it,
+// falling back to IPv6. This keeps the public IP the control plane observes (and
+// then advertises for the customer's DNS record) the box's IPv4 — the universal
+// default for web hosting — on the common dual-stack box, rather than whichever
+// family the OS happened to pick. An IPv6-only box still works via the fallback.
+func ipv4PreferringTransport() *http.Transport {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if conn, err := dialer.DialContext(ctx, "tcp4", addr); err == nil {
+			return conn, nil
+		}
+		return dialer.DialContext(ctx, "tcp6", addr)
+	}
+	return t
 }
 
 // SetToken sets the Bearer token used for all authenticated calls.
