@@ -18,11 +18,12 @@ the agent is the only thing that touches the customer box.
   `status`. The verb dispatch (`internal/verbs`) is a closed `switch` with no
   default execution path — an unknown verb is refused, never run. A compromised
   control plane cannot make the box run attacker-chosen commands.
-- **Unprivileged user + scoped sudo.** Runs as the `shipmono` system user.
-  The only elevated operations are an atomic symlink swap and a FrankenPHP
-  reload/restart, granted by a tight sudoers drop-in (never `ALL`). The agent
-  additionally asserts each `sudo` invocation matches one of those exact forms
-  *before* calling sudo (`assertSudoAllowed`), as defense in depth.
+- **Fully unprivileged — no sudo at all.** Runs as the `shipmono` system user
+  with **zero** privilege escalation. It owns `/srv/app`, so the atomic `current`
+  symlink swap is a plain rename; it reloads FrankenPHP through that server's
+  localhost admin API (`frankenphp reload`), not `systemctl`. There is no sudoers
+  entry and nothing setuid in its path, so the systemd sandbox keeps
+  `NoNewPrivileges=true` with no escalation surface to defend.
 - **Ephemeral git credentials.** The short-lived GitHub installation token is
   minted by the control plane per deploy and handed to the agent at poll time.
   It is passed to `git` through a `GIT_ASKPASS` shim (the agent re-invoking
@@ -60,27 +61,20 @@ curl -fsSL https://app.shipmono.dev/install.sh | sudo bash -s -- --pair <token> 
 
 That script lays out `/srv/app`, creates the `shipmono` user, installs FrankenPHP
 + Litestream + this agent (verifying the SHA256 checksum **before** executing),
-installs the scoped sudoers drop-in and a sandboxed systemd unit, then runs
-`shipmono-agent pair …` and starts `shipmono-agent.service`.
+and installs two sandboxed systemd units — one for the agent and one for the
+FrankenPHP web server (`shipmono-frankenphp.service`, which loads
+`/srv/app/shared/Caddyfile`) — then runs `shipmono-agent pair …` and starts them.
 
-The systemd unit runs the agent under the sandbox from the security doc §6:
+The agent's systemd unit runs under the sandbox from the security doc §6:
 `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
 `ReadWritePaths=/srv/app /var/lib/shipmono`, `CapabilityBoundingSet=` (empty),
 `SystemCallFilter=@system-service`, `RestrictAddressFamilies=AF_INET AF_INET6`.
 
-The sudoers drop-in grants exactly:
-
-```
-shipmono ALL=(root) NOPASSWD: /usr/bin/ln -sfn /srv/app/releases/* /srv/app/current
-shipmono ALL=(root) NOPASSWD: /usr/bin/systemctl reload  shipmono-frankenphp.service
-shipmono ALL=(root) NOPASSWD: /usr/bin/systemctl restart shipmono-frankenphp.service
-```
-
-> **Host-provisioning follow-up:** `install.sh` installs the FrankenPHP binary
-> but does not yet create the `shipmono-frankenphp.service` unit or point it at
-> the agent-generated `shared/Caddyfile`. Domain management writes
-> `shared/Caddyfile` and reloads that unit; wiring the unit to load that file is
-> a small `install.sh` addition to land alongside the first real deploy.
+**No sudoers, no privilege escalation.** Because the agent owns `/srv/app` and
+reloads FrankenPHP via its localhost admin API, it needs no elevated commands —
+so there is no `/etc/sudoers.d/shipmono`, and `NoNewPrivileges=true` holds with
+nothing to escalate. (Earlier sudo-based builds installed a sudoers drop-in;
+re-running `install.sh` removes it.)
 
 ## The verbs
 
@@ -166,7 +160,7 @@ Builds are reproducible: `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`,
 | release into `releases/<ts>`, symlink `shared/app.db` | `internal/executor/linux.go`, `internal/release` |
 | atomic symlink swap + graceful reload | `linuxExecutor.swapCurrent` / `reloadFrankenphp` |
 | rollback/reload/restore/add_domain/remove_domain/status | `internal/executor/linux.go` |
-| unprivileged user + scoped sudoers (never ALL) | `install.sh` (control plane) + `assertSudoAllowed` |
+| unprivileged user; elevated actions only via tight scoping | fully unprivileged — owns `/srv/app`, reloads via admin API; no sudo (`linux.go`) |
 | systemd sandbox block | `install.sh` (control plane); documented above |
 | token stored 0600, owned by agent user | `internal/credstore` |
 | honors `401 {revoked:true}` | `internal/daemon` revoke branch |

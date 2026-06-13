@@ -235,50 +235,35 @@ func (e *linuxExecutor) currentTarget() string {
 	return target
 }
 
-// swapCurrent atomically repoints current → releaseDir via the one sudo ln
-// form the host policy allows.
-func (e *linuxExecutor) swapCurrent(ctx context.Context, releaseDir string) error {
-	return e.runSudo(ctx, "/usr/bin/ln", "-sfn", releaseDir, e.layout.Current())
-}
-
-func (e *linuxExecutor) reloadFrankenphp(ctx context.Context) error {
-	return e.runSudo(ctx, "/usr/bin/systemctl", "reload", config.FrankenPHPUnit)
-}
-
-// runSudo runs an elevated command, but only after asserting it is one of the
-// exact forms the sudoers drop-in permits. Anything else is refused locally,
-// before sudo is ever invoked.
-func (e *linuxExecutor) runSudo(ctx context.Context, args ...string) error {
-	if err := e.assertSudoAllowed(args); err != nil {
-		return err
+// swapCurrent atomically repoints current → releaseDir. The agent owns the app
+// root (install.sh chowns /srv/app to the agent user), so this needs no
+// privilege: write a temp symlink in the same directory, then rename it over
+// `current` — rename(2) is atomic on the same filesystem.
+func (e *linuxExecutor) swapCurrent(_ context.Context, releaseDir string) error {
+	current := e.layout.Current()
+	tmp := current + ".tmp"
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear temp symlink: %w", err)
 	}
-	out, err := exec.CommandContext(ctx, "sudo", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sudo %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	if err := os.Symlink(releaseDir, tmp); err != nil {
+		return fmt.Errorf("create symlink: %w", err)
+	}
+	if err := os.Rename(tmp, current); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("swap current symlink: %w", err)
 	}
 	return nil
 }
 
-// assertSudoAllowed encodes the three permitted sudo forms from install.sh:
-//
-//	/usr/bin/ln -sfn <releases/*> <appRoot>/current
-//	/usr/bin/systemctl reload  shipmono-frankenphp.service
-//	/usr/bin/systemctl restart shipmono-frankenphp.service
-func (e *linuxExecutor) assertSudoAllowed(args []string) error {
-	current := e.layout.Current()
-	releasesPrefix := e.layout.ReleasesDir() + string(os.PathSeparator)
-
-	switch {
-	case len(args) == 4 && args[0] == "/usr/bin/ln" && args[1] == "-sfn" && args[3] == current:
-		target := filepath.Clean(args[2])
-		if !strings.HasPrefix(target, releasesPrefix) {
-			return fmt.Errorf("refused sudo ln: target %q not under %q", args[2], releasesPrefix)
-		}
-		return nil
-	case len(args) == 3 && args[0] == "/usr/bin/systemctl" &&
-		(args[1] == "reload" || args[1] == "restart") && args[2] == config.FrankenPHPUnit:
-		return nil
-	default:
-		return fmt.Errorf("refused sudo: %q is not an allowed elevated command", strings.Join(args, " "))
+// reloadFrankenphp gracefully reloads the running FrankenPHP server through its
+// localhost admin API (`frankenphp reload`), which needs no privilege — no sudo,
+// no systemctl. --force re-applies even when the Caddyfile is unchanged (a
+// symlink-swap deploy), so the new release's code is picked up.
+func (e *linuxExecutor) reloadFrankenphp(ctx context.Context) error {
+	out, err := exec.CommandContext(ctx, config.FrankenPHPBin,
+		"reload", "--config", e.caddyfilePath(), "--adapter", "caddyfile", "--force").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("frankenphp reload: %v: %s", err, strings.TrimSpace(string(out)))
 	}
+	return nil
 }

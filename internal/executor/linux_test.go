@@ -3,6 +3,9 @@
 package executor
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,39 +16,36 @@ func newLinuxFixture() *linuxExecutor {
 	return &linuxExecutor{layout: release.Layout{AppRoot: "/srv/app"}}
 }
 
-func TestAssertSudoAllowed(t *testing.T) {
-	e := newLinuxFixture()
+func TestSwapCurrentIsAtomicAndUnprivileged(t *testing.T) {
+	root := t.TempDir()
+	e := &linuxExecutor{deps: Deps{AppRoot: root}, layout: release.Layout{AppRoot: root}}
 
-	allowed := [][]string{
-		{"/usr/bin/ln", "-sfn", "/srv/app/releases/20260613T010203", "/srv/app/current"},
-		{"/usr/bin/systemctl", "reload", "shipmono-frankenphp.service"},
-		{"/usr/bin/systemctl", "restart", "shipmono-frankenphp.service"},
-	}
-	for _, args := range allowed {
-		if err := e.assertSudoAllowed(args); err != nil {
-			t.Errorf("assertSudoAllowed(%v) = %v, want nil", args, err)
+	relA := e.layout.Release("20260101T000000")
+	relB := e.layout.Release("20260102T000000")
+	for _, d := range []string{relA, relB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
 		}
 	}
 
-	refused := [][]string{
-		// ln target escapes the releases tree.
-		{"/usr/bin/ln", "-sfn", "/etc/passwd", "/srv/app/current"},
-		// ln target is a traversal that resolves outside releases.
-		{"/usr/bin/ln", "-sfn", "/srv/app/releases/../../etc", "/srv/app/current"},
-		// wrong link destination.
-		{"/usr/bin/ln", "-sfn", "/srv/app/releases/x", "/srv/app/evil"},
-		// arbitrary systemctl unit.
-		{"/usr/bin/systemctl", "reload", "sshd.service"},
-		// disallowed systemctl verb.
-		{"/usr/bin/systemctl", "stop", "shipmono-frankenphp.service"},
-		// not in the allowlist at all.
-		{"/bin/sh", "-c", "rm -rf /"},
-		{"/usr/bin/rm", "-rf", "/srv/app"},
+	// First swap creates `current`.
+	if err := e.swapCurrent(context.Background(), relA); err != nil {
+		t.Fatalf("first swap: %v", err)
 	}
-	for _, args := range refused {
-		if err := e.assertSudoAllowed(args); err == nil {
-			t.Errorf("assertSudoAllowed(%v) = nil, want refusal", args)
-		}
+	if target, _ := os.Readlink(e.layout.Current()); target != relA {
+		t.Errorf("current -> %q, want %q", target, relA)
+	}
+
+	// Second swap atomically replaces the existing symlink.
+	if err := e.swapCurrent(context.Background(), relB); err != nil {
+		t.Fatalf("second swap: %v", err)
+	}
+	if target, _ := os.Readlink(e.layout.Current()); target != relB {
+		t.Errorf("current -> %q, want %q", target, relB)
+	}
+	// No stray temp symlink left behind.
+	if _, err := os.Lstat(filepath.Join(root, "current.tmp")); !os.IsNotExist(err) {
+		t.Errorf("temp symlink should be gone, lstat err = %v", err)
 	}
 }
 

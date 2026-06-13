@@ -12,11 +12,15 @@ import (
 
 // Defaults mirror install.sh exactly. Changing these means changing install.sh.
 const (
-	DefaultHome     = "/var/lib/shipmono"
-	DefaultAppRoot  = "/srv/app"
-	DefaultPoll     = 2 * time.Second
-	FrankenPHPUnit  = "shipmono-frankenphp.service"
-	frankenPHPMatch = "frankenphp"
+	DefaultHome    = "/var/lib/shipmono"
+	DefaultAppRoot = "/srv/app"
+	DefaultPoll    = 2 * time.Second
+	// FrankenPHPUnit is the systemd unit name (used only for read-only health
+	// checks via `systemctl is-active`, which needs no privilege).
+	FrankenPHPUnit = "shipmono-frankenphp.service"
+	// FrankenPHPBin is the FrankenPHP binary, used to reload the running server
+	// via its localhost admin API — no sudo, no systemctl.
+	FrankenPHPBin = "/usr/local/bin/frankenphp"
 )
 
 // Config is the resolved runtime configuration.
