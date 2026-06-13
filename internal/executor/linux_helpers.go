@@ -120,18 +120,46 @@ func (e *linuxExecutor) readDomains() []string {
 	return out
 }
 
-// renderCaddyfile builds a FrankenPHP/Caddy site config serving the current
-// release's public root for the configured domains (automatic HTTPS). With no
-// domains it serves plain HTTP on :80 so the box still responds.
+// renderCaddyfile builds the FrankenPHP/Caddy config serving the current release
+// for the configured domains (automatic HTTPS). With no domains it serves plain
+// HTTP on :80 so the box still responds. The shape must match the Caddyfile
+// install.sh seeds, so adding or removing a domain doesn't change where or how
+// the app is served:
+//   - the global `frankenphp` block initialises the PHP runtime (required);
+//   - the web root is public/ when public/index.php exists, else the repo top,
+//     decided per request so it adapts to whatever each deploy ships;
+//   - dotfiles are never served as static files.
 func (e *linuxExecutor) renderCaddyfile(domains []string) string {
-	root := filepath.Join(e.layout.Current(), "public")
-	var b strings.Builder
-	if len(domains) == 0 {
-		fmt.Fprintf(&b, ":80 {\n\troot * %s\n\tphp_server\n}\n", root)
-		return b.String()
+	site := ":80"
+	if len(domains) > 0 {
+		site = strings.Join(domains, " ")
 	}
-	fmt.Fprintf(&b, "%s {\n\troot * %s\n\tphp_server\n}\n", strings.Join(domains, " "), root)
-	return b.String()
+	root := e.layout.Current()
+	return fmt.Sprintf(`{
+	frankenphp
+}
+
+%s {
+	root * %s
+	encode gzip
+
+	@dotfiles path /.*
+	handle @dotfiles {
+		respond 404
+	}
+
+	@haspublic file {
+		try_files /public/index.php
+	}
+	handle @haspublic {
+		root * %s/public
+		php_server
+	}
+	handle {
+		php_server
+	}
+}
+`, site, root, root)
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {

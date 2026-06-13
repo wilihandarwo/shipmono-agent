@@ -66,11 +66,17 @@ func TestValidateDomain(t *testing.T) {
 
 func TestRenderCaddyfile(t *testing.T) {
 	e := newLinuxFixture()
-	if got := e.renderCaddyfile(nil); !strings.Contains(got, ":80") {
-		t.Errorf("empty-domain Caddyfile should serve :80, got %q", got)
+	empty := e.renderCaddyfile(nil)
+	for _, want := range []string{"{\n\tfrankenphp\n}", ":80 {", "respond 404", "@haspublic file"} {
+		if !strings.Contains(empty, want) {
+			t.Errorf("empty-domain Caddyfile missing %q, got %q", want, empty)
+		}
 	}
 	got := e.renderCaddyfile([]string{"a.com", "b.com"})
-	if !strings.Contains(got, "a.com b.com {") || !strings.Contains(got, "/srv/app/current/public") {
+	// Flexible root: the repo top is the default, public/ is the override.
+	if !strings.Contains(got, "a.com b.com {") ||
+		!strings.Contains(got, "root * /srv/app/current\n") ||
+		!strings.Contains(got, "root * /srv/app/current/public\n") {
 		t.Errorf("Caddyfile = %q", got)
 	}
 }
