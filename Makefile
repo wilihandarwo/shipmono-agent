@@ -56,9 +56,10 @@ fmt-check: ## Fail if any file is not gofmt-clean
 	if [ -n "$$unformatted" ]; then echo "gofmt needed:"; echo "$$unformatted"; exit 1; fi
 
 .PHONY: staticcheck
-staticcheck: ## Run staticcheck (installed on demand)
+staticcheck: ## Run staticcheck for host + linux build tags (installed on demand)
 	@command -v staticcheck >/dev/null 2>&1 || go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
 	staticcheck ./...
+	GOOS=linux staticcheck ./...
 
 .PHONY: lint
 lint: fmt-check vet staticcheck ## All static checks

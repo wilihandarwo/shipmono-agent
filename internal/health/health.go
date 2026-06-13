@@ -41,18 +41,3 @@ func (s staticSampler) Sample(context.Context) controlplane.HealthBlob {
 	}
 	return b
 }
-
-// simulated is the plausible fixed blob the off-Linux stub and the simulated
-// executor report. Values sit in the same ranges the Ruby simulator emits.
-func simulated() controlplane.HealthBlob {
-	return controlplane.HealthBlob{
-		AgentVersion:      version.Version,
-		FrankenPHPVersion: "1.4.4",
-		FrankenPHPHealthy: true,
-		DiskFreeBytes:     42_000_000_000,
-		LoadAvg:           "0.25",
-		CPUPercent:        24,
-		RAMPercent:        46,
-		DiskPercent:       38,
-	}
-}
