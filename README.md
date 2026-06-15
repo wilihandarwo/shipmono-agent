@@ -60,10 +60,18 @@ curl -fsSL https://app.shipmono.dev/install.sh | sudo bash -s -- --pair <token> 
 ```
 
 That script lays out `/srv/app`, creates the `shipmono` user, installs FrankenPHP
-+ Litestream + this agent (verifying the SHA256 checksum **before** executing),
-and installs two sandboxed systemd units — one for the agent and one for the
-FrankenPHP web server (`shipmono-frankenphp.service`, which loads
-`/srv/app/shared/Caddyfile`) — then runs `shipmono-agent pair …` and starts them.
++ Litestream + this agent, and installs two sandboxed systemd units — one for the
+agent and one for the FrankenPHP web server (`shipmono-frankenphp.service`, which
+loads `/srv/app/shared/Caddyfile`) — then runs `shipmono-agent pair …` and starts
+them.
+
+For the agent specifically, `install.sh` does a **two-stage supply-chain check
+before executing the binary** (checklist §2.3): it first verifies
+`checksums.txt.minisig` against the pinned minisign public key, and only then
+trusts the SHA256 in that `checksums.txt` to verify the downloaded binary —
+**signature gates checksum gates execution**. It installs `minisign` and **fails
+closed** if it's unavailable or the signature doesn't match. (FrankenPHP and
+Litestream, which publish no checksums file, are pinned by SHA256 instead.)
 
 The agent's systemd unit runs under the sandbox from the security doc §6:
 `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
@@ -142,6 +150,8 @@ make lint                 # gofmt check + go vet (host+linux) + staticcheck
 make build-linux          # static linux/amd64 + linux/arm64
 make release VERSION=0.1.0 # both arches + checksums.txt (what install.sh verifies)
 make verify-reproducible  # build twice, assert byte-identical
+make sign                 # minisign-sign checksums.txt (local only; prompts for key password)
+make verify-sig           # verify checksums.txt.minisig against the pinned public key
 ```
 
 Builds are reproducible: `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`,
@@ -149,6 +159,39 @@ Builds are reproducible: `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`,
 `.github/workflows/ci.yml`). The release artifacts are named exactly
 `shipmono-agent-linux-{amd64,arm64}` with a `checksums.txt`, which is what
 `install.sh` downloads and verifies.
+
+### Signing (checklist §2.3)
+
+Releases are signed with **minisign**. The signing key is offline (maintainer's
+machine + 1Password) and **never touches CI** — CI publishes the binaries,
+`checksums.txt`, and the SBOM; the maintainer attaches the signature afterwards.
+Because builds are byte-identical (`make verify-reproducible`), a locally rebuilt
+`checksums.txt` matches the one CI published, so the local signature is valid for
+the published file.
+
+Canonical public key (pinned in `install.sh` and the control-plane checklist):
+
+```
+untrusted comment: minisign public key DDA30285B93C0171
+RWRxATy5hQKj3cibUyQYEEa9S43hzWOrM9+ODfuH1inY1RULD6+spEwQ
+```
+
+**Release ritual** (after `git tag vX.Y.Z && git push --tags` triggers CI to
+publish the artifacts):
+
+```sh
+make release VERSION=X.Y.Z   # rebuild the reproducible checksums.txt locally
+make verify-reproducible     # sanity: byte-identical to CI's build
+make sign                    # produces dist/checksums.txt.minisig (enter key password)
+make verify-sig              # confirm the signature verifies against the pinned key
+gh release upload vX.Y.Z dist/checksums.txt.minisig
+```
+
+Verify a downloaded release yourself with:
+
+```sh
+minisign -Vm checksums.txt -P "RWRxATy5hQKj3cibUyQYEEa9S43hzWOrM9+ODfuH1inY1RULD6+spEwQ"
+```
 
 ## Mapping to production-readiness checklist §1.1
 
@@ -165,7 +208,8 @@ Builds are reproducible: `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`,
 | token stored 0600, owned by agent user | `internal/credstore` |
 | honors `401 {revoked:true}` | `internal/daemon` revoke branch |
 | reproducible builds, cross-compile amd64/arm64 | `Makefile`, `.github/workflows/ci.yml` |
+| signed releases (minisign) + SBOM (Tier 2.3) | `make sign`/`verify-sig`, `.github/workflows/ci.yml`, verified in `install.sh` |
 
-Deferred per their tiers: mTLS for the agent channel (Tier 2.1) and signed
-releases / minisign verification (Tier 2.3). The bearer-token auth here is the
-v1 model.
+Deferred per their tiers: mTLS for the agent channel (Tier 2.1). The bearer-token
+auth here is the v1 model. Signed releases / minisign verification (Tier 2.3) are
+now in place (see Build & release → Signing).

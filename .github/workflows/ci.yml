@@ -72,6 +72,17 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: build release artifacts
         run: make release VERSION="${GITHUB_REF_NAME#v}"
+      - name: generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+      # CI publishes the binaries + checksums + SBOM. It does NOT sign:
+      # checksums.txt.minisig is produced locally with the offline minisign key
+      # (the secret never touches CI) and attached via `gh release upload`
+      # afterwards (see README → Build & release). install.sh fails closed if the
+      # signature is missing.
       - name: publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -79,3 +90,4 @@ jobs:
             dist/shipmono-agent-linux-amd64
             dist/shipmono-agent-linux-arm64
             dist/checksums.txt
+            sbom.spdx.json

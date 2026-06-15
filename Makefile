@@ -9,6 +9,11 @@
 PKG        := github.com/wilihandarwo/shipmono-agent
 VERSION    ?= dev
 DIST       := dist
+# Release signing (checklist §2.3). The secret key lives only on the maintainer's
+# machine + 1Password — never in CI. PUBKEY is the canonical minisign public key
+# (id DDA30285B93C0171); install.sh and the agent README pin the same value.
+SIGN_KEY   ?= $(HOME)/shipmono-keys/shipmono-agent.key
+PUBKEY     := RWRxATy5hQKj3cibUyQYEEa9S43hzWOrM9+ODfuH1inY1RULD6+spEwQ
 LDFLAGS    := -s -w -X $(PKG)/internal/version.Version=$(VERSION)
 # Reproducible: -trimpath strips local paths, CGO off for a static binary,
 # -buildvcs=false drops VCS stamping that would vary the output.
@@ -31,6 +36,18 @@ release: build-linux ## Build both arches and write checksums.txt
 	cd $(DIST) && shasum -a 256 shipmono-agent-linux-amd64 shipmono-agent-linux-arm64 > checksums.txt
 	@echo "Release artifacts in $(DIST)/ (version $(VERSION)):"
 	@cat $(DIST)/checksums.txt
+
+.PHONY: sign
+sign: ## Sign dist/checksums.txt with minisign (local only; prompts for the key password)
+	@command -v minisign >/dev/null 2>&1 || { echo "minisign not installed (brew install minisign)"; exit 1; }
+	@test -f $(DIST)/checksums.txt || { echo "no $(DIST)/checksums.txt — run 'make release' first"; exit 1; }
+	minisign -Sm $(DIST)/checksums.txt -s $(SIGN_KEY)
+	@echo "Signed: $(DIST)/checksums.txt.minisig — upload it to the GitHub release."
+
+.PHONY: verify-sig
+verify-sig: ## Verify dist/checksums.txt.minisig against the pinned public key
+	@command -v minisign >/dev/null 2>&1 || { echo "minisign not installed (brew install minisign)"; exit 1; }
+	minisign -Vm $(DIST)/checksums.txt -P "$(PUBKEY)"
 
 .PHONY: verify-reproducible
 verify-reproducible: ## Build twice and confirm byte-identical linux binaries
