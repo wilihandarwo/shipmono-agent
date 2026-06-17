@@ -16,6 +16,14 @@ import (
 // FileName is the credential filename inside SHIPMONO_HOME.
 const FileName = "credential.json"
 
+// mTLS material filenames inside SHIPMONO_HOME (control-plane security architecture §4).
+// All are written 0600 like the credential. The key never leaves the box.
+const (
+	KeyFileName  = "client.key"    // the agent's private key
+	CertFileName = "client.crt"    // its signed leaf (+ chain) presented over mTLS
+	CAFileName   = "ca_bundle.pem" // the control-plane CA the agent pins
+)
+
 // Mode is the required permission bits: read/write for the owner only.
 const Mode fs.FileMode = 0o600
 
@@ -24,6 +32,10 @@ type Credential struct {
 	Host       string `json:"host"`
 	AgentToken string `json:"agent_token"`
 	ServerID   int    `json:"server_id"`
+	// AgentEndpoint is the mTLS host for all calls after registration (e.g.
+	// "agents.shipmono.dev:8443"). Empty when the control plane isn't running mTLS
+	// (dev/test), in which case the agent stays bearer-only against Host.
+	AgentEndpoint string `json:"agent_endpoint,omitempty"`
 }
 
 // ErrNotPaired is returned by Load when no credential exists.
@@ -104,12 +116,82 @@ func Save(home string, c Credential) error {
 	return nil
 }
 
-// Delete removes the credential. Called when the control plane reports the
-// identity as revoked. Absence is not an error (idempotent).
+// Delete removes the credential and any mTLS material. Called when the control
+// plane reports the identity as revoked. Absence is not an error (idempotent).
 func Delete(home string) error {
-	err := os.Remove(Path(home))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+	for _, name := range []string{FileName, CertFileName, KeyFileName, CAFileName} {
+		if err := os.Remove(filepath.Join(home, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 	}
-	return err
+	return nil
+}
+
+// SaveCertMaterial persists the mTLS leaf(+chain), private key, and CA bundle, each 0600.
+func SaveCertMaterial(home string, certPEM, keyPEM, caPEM []byte) error {
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return fmt.Errorf("credstore: mkdir home: %w", err)
+	}
+	files := map[string][]byte{CertFileName: certPEM, KeyFileName: keyPEM, CAFileName: caPEM}
+	for name, data := range files {
+		if err := writeSecret(filepath.Join(home, name), data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadCertMaterial reads the mTLS leaf(+chain), key, and CA bundle.
+func LoadCertMaterial(home string) (certPEM, keyPEM, caPEM []byte, err error) {
+	if certPEM, err = os.ReadFile(filepath.Join(home, CertFileName)); err != nil {
+		return nil, nil, nil, fmt.Errorf("credstore: read cert: %w", err)
+	}
+	if keyPEM, err = os.ReadFile(filepath.Join(home, KeyFileName)); err != nil {
+		return nil, nil, nil, fmt.Errorf("credstore: read key: %w", err)
+	}
+	if caPEM, err = os.ReadFile(filepath.Join(home, CAFileName)); err != nil {
+		return nil, nil, nil, fmt.Errorf("credstore: read ca: %w", err)
+	}
+	return certPEM, keyPEM, caPEM, nil
+}
+
+// HasCertMaterial reports whether all three mTLS files are present.
+func HasCertMaterial(home string) bool {
+	for _, name := range []string{CertFileName, KeyFileName, CAFileName} {
+		if _, err := os.Stat(filepath.Join(home, name)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// writeSecret writes data to path atomically with mode 0600 (temp file, fsync, rename).
+func writeSecret(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("credstore: create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if err := tmp.Chmod(Mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("credstore: chmod temp: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("credstore: write temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("credstore: sync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("credstore: close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("credstore: rename: %w", err)
+	}
+	return nil
 }

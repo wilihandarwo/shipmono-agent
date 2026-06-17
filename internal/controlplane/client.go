@@ -8,6 +8,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,15 +29,29 @@ type Client struct {
 }
 
 // New returns a Client for the given control-plane base URL (e.g.
-// "https://app.shipmono.dev"). A trailing slash is trimmed.
+// "https://app.shipmono.dev"). A trailing slash is trimmed. Used for the
+// unauthenticated pairing call and for bearer-only operation (dev/test).
 func New(baseURL string) *Client {
+	return newClient(baseURL, ipv4PreferringTransport())
+}
+
+// NewWithTLS returns a Client that speaks mutual TLS: it presents the client cert
+// from tlsConfig and pins the control-plane CA in it (security architecture §4).
+// Used for all steady-state calls against the mTLS endpoint after pairing.
+func NewWithTLS(baseURL string, tlsConfig *tls.Config) *Client {
+	t := ipv4PreferringTransport()
+	t.TLSClientConfig = tlsConfig
+	return newClient(baseURL, t)
+}
+
+func newClient(baseURL string, t *http.Transport) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		httpc: &http.Client{
 			// Generous enough for slow networks, short enough that a hung
 			// control plane doesn't wedge the loop forever.
 			Timeout:   20 * time.Second,
-			Transport: ipv4PreferringTransport(),
+			Transport: t,
 		},
 	}
 }
@@ -83,6 +98,27 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (RegisterRes
 		return RegisterResponse{}, ErrRateLimited
 	default:
 		return RegisterResponse{}, &UnexpectedStatusError{Op: "register", Code: resp.StatusCode, Body: string(body)}
+	}
+}
+
+// RenewCertificate exchanges a fresh CSR for a renewed client cert (security
+// architecture §4). Authenticated over the existing mTLS channel.
+func (c *Client) RenewCertificate(ctx context.Context, csr string) (RenewResponse, error) {
+	resp, body, err := c.do(ctx, "certificate/renew", "/agent/v1/certificate/renew", RenewRequest{CSR: csr}, true)
+	if err != nil {
+		return RenewResponse{}, err
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out RenewResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			return RenewResponse{}, fmt.Errorf("controlplane: decode renew response: %w", err)
+		}
+		return out, nil
+	case http.StatusUnauthorized:
+		return RenewResponse{}, classifyUnauthorized(body)
+	default:
+		return RenewResponse{}, &UnexpectedStatusError{Op: "certificate/renew", Code: resp.StatusCode, Body: string(body)}
 	}
 }
 

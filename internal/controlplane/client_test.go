@@ -151,3 +151,47 @@ func TestUnexpectedStatus(t *testing.T) {
 		t.Fatalf("err = %v, want UnexpectedStatusError 500", err)
 	}
 }
+
+func TestRenewCertificate(t *testing.T) {
+	t.Run("200 returns the new cert and sends the CSR + bearer", func(t *testing.T) {
+		var gotBody, gotAuth, gotPath string
+		c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			gotAuth = r.Header.Get("Authorization")
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			w.WriteHeader(200)
+			io.WriteString(w, `{"client_certificate":"LEAF","certificate_chain":"CHAIN","ca_bundle":"CA"}`)
+		})
+		defer srv.Close()
+
+		resp, err := c.RenewCertificate(context.Background(), "CSRPEM")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.CertificateChain != "CHAIN" || resp.CABundle != "CA" {
+			t.Errorf("resp = %+v", resp)
+		}
+		if gotPath != "/agent/v1/certificate/renew" {
+			t.Errorf("path = %s", gotPath)
+		}
+		if gotAuth != "Bearer agt_test" {
+			t.Errorf("auth = %q", gotAuth)
+		}
+		if !strings.Contains(gotBody, `"csr":"CSRPEM"`) {
+			t.Errorf("body = %s", gotBody)
+		}
+	})
+
+	t.Run("401 revoked is classified", func(t *testing.T) {
+		c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(401)
+			io.WriteString(w, `{"revoked":true}`)
+		})
+		defer srv.Close()
+		_, err := c.RenewCertificate(context.Background(), "CSRPEM")
+		if !errors.Is(err, ErrRevoked) {
+			t.Fatalf("err = %v, want ErrRevoked", err)
+		}
+	})
+}
