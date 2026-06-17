@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/wilihandarwo/shipmono-agent/internal/config"
 	"github.com/wilihandarwo/shipmono-agent/internal/controlplane"
@@ -29,6 +30,7 @@ import (
 	"github.com/wilihandarwo/shipmono-agent/internal/executor"
 	"github.com/wilihandarwo/shipmono-agent/internal/gitops"
 	"github.com/wilihandarwo/shipmono-agent/internal/health"
+	"github.com/wilihandarwo/shipmono-agent/internal/mtls"
 	"github.com/wilihandarwo/shipmono-agent/internal/version"
 )
 
@@ -82,6 +84,14 @@ func cmdPair(args []string, stdout, stderr io.Writer) int {
 	cfg := config.Load()
 	cfg.Host = strings.TrimRight(*host, "/")
 
+	// Generate our mTLS keypair + CSR up front; the private key never leaves the box.
+	// Harmless if the control plane isn't running mTLS — it just won't sign it.
+	keyPEM, csrPEM, err := mtls.GenerateKeyAndCSR(mtls.DefaultCN)
+	if err != nil {
+		fmt.Fprintf(stderr, "could not generate client key: %v\n", err)
+		return 1
+	}
+
 	osName, osVersion := osRelease()
 	client := controlplane.New(cfg.Host)
 	resp, err := client.Register(context.Background(), controlplane.RegisterRequest{
@@ -89,22 +99,43 @@ func cmdPair(args []string, stdout, stderr io.Writer) int {
 		OSName:       osName,
 		OSVersion:    osVersion,
 		AgentVersion: version.Version,
+		CSR:          string(csrPEM),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pairing failed: %v\n", err)
 		return 1
 	}
 
-	if err := credstore.Save(cfg.Home, credstore.Credential{
+	cred := credstore.Credential{
 		Host:       cfg.Host,
 		AgentToken: resp.AgentToken,
 		ServerID:   resp.ServerID,
-	}); err != nil {
+	}
+
+	// If the control plane signed our CSR, persist the mTLS material and switch
+	// steady-state traffic to the mTLS endpoint.
+	if resp.ClientCertificate != "" {
+		certPEM := resp.CertificateChain
+		if certPEM == "" {
+			certPEM = resp.ClientCertificate
+		}
+		if err := credstore.SaveCertMaterial(cfg.Home, []byte(certPEM), keyPEM, []byte(resp.CABundle)); err != nil {
+			fmt.Fprintf(stderr, "could not save client certificate: %v\n", err)
+			return 1
+		}
+		cred.AgentEndpoint = resp.AgentEndpoint
+	}
+
+	if err := credstore.Save(cfg.Home, cred); err != nil {
 		fmt.Fprintf(stderr, "could not save credential: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "✓ Paired (server #%d). Credential saved to %s (0600).\n", resp.ServerID, credstore.Path(cfg.Home))
+	if cred.AgentEndpoint != "" {
+		fmt.Fprintf(stdout, "✓ Paired (server #%d) with mTLS. Endpoint: %s.\n", resp.ServerID, cred.AgentEndpoint)
+	} else {
+		fmt.Fprintf(stdout, "✓ Paired (server #%d). Credential saved to %s (0600).\n", resp.ServerID, credstore.Path(cfg.Home))
+	}
 	fmt.Fprintln(stdout, "The systemd unit (shipmono-agent.service) will start polling.")
 	return 0
 }
@@ -117,23 +148,109 @@ func cmdRun() int {
 		slog.Error("not paired", "err", err, "hint", "run `shipmono-agent pair --token <t> --host <url>` first")
 		return 1
 	}
-	cfg.Host = cred.Host
-
-	client := controlplane.New(cfg.Host)
-	client.SetToken(cred.AgentToken)
-
-	sampler := health.New(cfg.AppRoot)
-	ex := executor.New(cfg, sampler)
 
 	// Graceful shutdown on SIGTERM/SIGINT (systemd stop, Ctrl-C).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	var client *controlplane.Client
+	if cred.AgentEndpoint != "" && credstore.HasCertMaterial(cfg.Home) {
+		// mTLS: present our client cert + pin the control-plane CA, and keep the cert
+		// fresh in the background.
+		certPEM, keyPEM, caPEM, lerr := credstore.LoadCertMaterial(cfg.Home)
+		if lerr != nil {
+			slog.Error("could not load mTLS material", "err", lerr)
+			return 1
+		}
+		holder, herr := mtls.NewHolder(certPEM, keyPEM)
+		if herr != nil {
+			slog.Error("could not load client certificate", "err", herr)
+			return 1
+		}
+		tlsCfg, terr := mtls.TLSConfig(holder, caPEM)
+		if terr != nil {
+			slog.Error("could not build mTLS config", "err", terr)
+			return 1
+		}
+		cfg.Host = endpointURL(cred.AgentEndpoint)
+		client = controlplane.NewWithTLS(cfg.Host, tlsCfg)
+		client.SetToken(cred.AgentToken)
+		go renewCertLoop(ctx, client, holder, cfg.Home)
+	} else {
+		// Bearer-only (dev/test, or a control plane not running mTLS).
+		cfg.Host = cred.Host
+		client = controlplane.New(cfg.Host)
+		client.SetToken(cred.AgentToken)
+	}
+
+	sampler := health.New(cfg.AppRoot)
+	ex := executor.New(cfg, sampler)
 
 	if err := daemon.Run(ctx, cfg, client, ex, sampler); err != nil {
 		slog.Error("agent stopped with error", "err", err)
 		return 1
 	}
 	return 0
+}
+
+// endpointURL normalises a bare host[:port] (e.g. "agents.shipmono.dev:8443") to an
+// https URL, leaving an already-qualified URL untouched.
+func endpointURL(endpoint string) string {
+	if strings.Contains(endpoint, "://") {
+		return strings.TrimRight(endpoint, "/")
+	}
+	return "https://" + endpoint
+}
+
+// renewBefore is how long before expiry to renew. For the control plane's 7-day leaf TTL
+// this lands renewal at ~2/3 of life, leaving ample slack if the box is briefly offline.
+const renewBefore = 56 * time.Hour
+
+// renewCertLoop periodically renews the client certificate before it expires, swapping the
+// live cert in place (new TLS handshakes pick it up). Best-effort: a failed renewal is
+// retried on the next tick, and the cert is still valid until renewBefore elapses.
+func renewCertLoop(ctx context.Context, client *controlplane.Client, holder *mtls.Holder, home string) {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			notAfter, err := holder.NotAfter()
+			if err != nil {
+				slog.Warn("cert renewal: cannot read expiry", "err", err)
+				continue
+			}
+			if time.Until(notAfter) > renewBefore {
+				continue
+			}
+			if err := renewOnce(ctx, client, holder, home); err != nil {
+				slog.Warn("cert renewal failed; will retry", "err", err)
+			} else {
+				slog.Info("client certificate renewed")
+			}
+		}
+	}
+}
+
+func renewOnce(ctx context.Context, client *controlplane.Client, holder *mtls.Holder, home string) error {
+	keyPEM, csrPEM, err := mtls.GenerateKeyAndCSR(mtls.DefaultCN)
+	if err != nil {
+		return err
+	}
+	resp, err := client.RenewCertificate(ctx, string(csrPEM))
+	if err != nil {
+		return err
+	}
+	certPEM := resp.CertificateChain
+	if certPEM == "" {
+		certPEM = resp.ClientCertificate
+	}
+	if err := credstore.SaveCertMaterial(home, []byte(certPEM), keyPEM, []byte(resp.CABundle)); err != nil {
+		return err
+	}
+	return holder.Set([]byte(certPEM), keyPEM)
 }
 
 func configureLogging(w io.Writer) {

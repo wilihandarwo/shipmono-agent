@@ -4,20 +4,40 @@ import "encoding/json"
 
 // RegisterRequest is the body of POST /agent/v1/register. It is the only
 // unauthenticated call: a one-time pairing token is exchanged for a permanent
-// agent token.
+// agent token. CSR carries the agent-generated certificate request for the mTLS
+// identity (security architecture §4); omitted when the agent runs bearer-only.
 type RegisterRequest struct {
 	PairingToken string `json:"pairing_token"`
 	OSName       string `json:"os_name"`
 	OSVersion    string `json:"os_version"`
 	IPAddress    string `json:"ip_address,omitempty"`
 	AgentVersion string `json:"agent_version,omitempty"`
+	CSR          string `json:"csr,omitempty"`
 }
 
-// RegisterResponse is the 201 body from register.
+// RegisterResponse is the 201 body from register. The certificate fields are
+// present only when the control plane is running mTLS (it signed the CSR).
 type RegisterResponse struct {
 	AgentToken   string `json:"agent_token"`
 	ServerID     int    `json:"server_id"`
 	PollInterval int    `json:"poll_interval"`
+
+	ClientCertificate string `json:"client_certificate,omitempty"`
+	CertificateChain  string `json:"certificate_chain,omitempty"`
+	CABundle          string `json:"ca_bundle,omitempty"`
+	AgentEndpoint     string `json:"agent_endpoint,omitempty"`
+}
+
+// RenewRequest is the body of POST /agent/v1/certificate/renew.
+type RenewRequest struct {
+	CSR string `json:"csr"`
+}
+
+// RenewResponse is the 200 body from certificate renewal.
+type RenewResponse struct {
+	ClientCertificate string `json:"client_certificate"`
+	CertificateChain  string `json:"certificate_chain"`
+	CABundle          string `json:"ca_bundle"`
 }
 
 // Command is the 200 body from POST /agent/v1/commands/poll. Params and
